@@ -315,35 +315,35 @@ The Scheduler is the brain. It runs on each GPU, manages the Engine beneath it, 
 ┌───────────────────────────────────────────┐
 │              SCHEDULER                    │
 │                                           │
-│  ┌─────────────┐  ┌───────────────────┐   │
-│  │ PrefillManager│  │  DecodeManager   │  │
-│  │ (chunked      │  │  (running reqs)  │  │
-│  │  prefill)     │  │                   │  │
-│  └──────┬───────┘  └────────┬──────────┘  │
-│         │ schedule_next_batch()           │
-│         └──────────┬───────────────────┘  │
-│                    ▼                       │
+│  ┌────────────────┐  ┌───────────────────┐│
+│  │ PrefillManager │  │  DecodeManager    ││
+│  │ (chunked       │  │  (running reqs)   ││
+│  │  prefill)      │  │                   ││
+│  └──────┬─────────┘  └────────────┬──────┘│
+│         │ schedule_next_batch()   │       │
+│         └──────────┬──────────────┘       │
+│                    ▼                      │
 │  ┌────────────────────────────────────┐   │
 │  │  CacheManager                      │   │
-│  │  (KV cache alloc/free, prefix match)│  │
+│  │  (KV cache alloc/free,prefix match)│   │
 │  └────────────────────────────────────┘   │
 │  ┌──────────────┐  ┌──────────────────┐   │
 │  │ TableManager │  │ SchedulerIOMixin │   │
 │  │ (page slots) │  │ (ZMQ recv/send)  │   │
 │  └──────────────┘  └──────────────────┘   │
-└──────────────────────────────────────────┘
+└───────────────────────────────────────────┘
 ```
 
 ### Main Event Loop
 
 Two modes:
 
-**Normal loop** (sequential):
+Normal loop (sequential):
 ```
 receive_msgs → schedule_batch → forward → process_results → repeat
 ```
 
-**Overlap loop** (pipelined):
+Overlap(重叠) loop (pipelined):
 ```
         CPU stream              │        GPU (Engine) stream
 ────────────────────────────────┼────────────────────────────
@@ -355,7 +355,7 @@ Step 3: process LAST results    │     ...compute...
         schedule_batch          │
         └── launch forward ─────│──→  forward (async)
 Step 4: process LAST results    │     ...compute...
-        ...                      │
+        ...                     │
 ```
 The key insight: while GPU computes batch N, CPU prepares batch N+1 on a separate CUDA stream.
 
@@ -381,11 +381,11 @@ Step 4: decode → produce output tokens one by one
 
 Keeps a `Set[Req]` of requests currently decoding. Simple but careful about:
 - `filter_reqs()`: after a batch completes, remove finished reqs, add new ones ready for decode
-- `inflight_tokens`: estimates reserved memory to prevent PrefillManager from over-allocating
+- `inflight_tokens`(在运行中的): estimates reserved memory to prevent PrefillManager from over-allocating
 
 ### TableManager — Page Table Slots
 
-Each request gets a `table_idx` (row in the page table tensor). TableManager is a simple free-list allocator:
+Each request gets a `table_idx` (row in the page table tensor). TableManager(表管理器) is a simple free-list allocator:
 - `allocate()` → pop a slot, `free(slot)` → push it back
 - `token_pool[table_idx, :]` stores the actual token IDs on GPU
 
