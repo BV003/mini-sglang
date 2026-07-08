@@ -405,7 +405,42 @@ Wraps the prefix cache (Naive/Radix). Key operations:
 
 ## KV Cache Management
 
+Three layers:
+
+1. GPU Buffer (`kvcache/mha_pool.py`) — raw tensor `(2, num_layers, num_pages, page_size, kv_heads, head_dim)`. `[0]`=K, `[1]`=V. `store_kv()` copies attention output into the pool.
+
+2. Prefix Cache (`kvcache/radix_cache.py` or `naive_cache.py`) — radix tree matches token prefixes and shares cached K/V across requests. Naive variant always returns miss. Key ops: `match_prefix`, `insert_prefix`, `lock_handle`, `evict`. Caching is page-aligned.
+
+3. CacheManager (`scheduler/cache.py`) — scheduler-facing coordinator. `allocate_paged()` assigns free pages (evicts if needed). `cache_req()` inserts completed prefill tokens into prefix cache, frees duplicate pages. `lazy_free_region()` batches frees for efficiency.
+
+Page table: `page_table[req_id, token_pos]` maps to physical KV index. Shape `(max_running_reqs, max_seq_len)`. Backends divide by `page_size` to get logical page indices.
+
+Request lifecycle:
+- Prefill: `match_req()` → get `cached_len` → copy cached page-table entries → `allocate_paged()` for new tokens → attention runs → `cache_req()` inserts into prefix cache.
+- Decode: extend 1 token/step → allocate 1 slot → store KV → `complete_one()`.
+- Completion: `cache_req(req, finished=True)` frees pages + releases handle; `TableManager.free()` returns slot.
+
+Design notes: page-aligned (page_size 16/32/64), reference-counted handles prevent eviction of in-use cache, LRU eviction via min-heap over leaf nodes, chunked prefill shares `cache_handle`/`table_idx` across splits, KV cache sharded by TP rank.
+
 ## Attention Backends
+
+Purpose: compute attention without recomputing past K/V from scratch. Each backend reads from the paged KV cache, only computes attention for new tokens, then stores the new K/V back into the cache. This is how we avoid O(n²) cost over the full sequence.
+
+All three backends can handle both prefill and decode. The interface is the same (`BaseAttnBackend`). They differ in which GPU kernel library they call and which hardware they optimize for.
+
+1. FlashAttention (`attention/fa.py`) — calls `sgl_kernel.flash_attn.flash_attn_with_kvcache`. Supports page_size > 1.
+
+2. FlashInfer (`attention/fi.py`) — uses `flashinfer.BatchPrefillWithPagedKVCacheWrapper` / `BatchDecodeWithPagedKVCacheWrapper`. Requires page_size=1. Runs an async planning step (`wrapper.plan()`) before each forward.
+
+3. TensorRT-LLM (`attention/trtllm.py`) — uses `flashinfer.trtllm_batch_{context,decode}_with_kv_cache`. For Blackwell (B200).
+
+Hybrid mode: combine separate prefill and decode backends. Example: `"fa,fi"` = FA prefill + FlashInfer decode. This is the default on H100 because FA handles variable-length prefill better, while FlashInfer decode integrates cleaner with CUDA graphs.
+
+Common flow per layer: `prepare_metadata(batch)` → scheduler computes cu_seqlens, cache_seqlens, page_table from requests. `forward(q, k, v, layer_id, batch)` → stores K/V into cache, then runs paged attention kernel.
+
+CUDA graph support: all three implement `init_capture_graph` / `prepare_for_capture` / `prepare_for_replay` for decode. Pre-allocated buffers hold seq_lens and page_table; during replay real data is copied in.
+
+Auto-selection: B200 → trtllm, H100 → fa+fi hybrid, others → fi.
 
 ## Model Implementations (Layers & Architectures) 
 
