@@ -527,6 +527,63 @@ Two backends, both wrapped by `DistributedCommunicator`:
 
 Column-parallel layers (QKV, gate_up) and replicated layers (MoE router) don't need communication because each rank's output is already correct for the next column-parallel layer.
 
-## Overlap Scheduling 
+## Overlap Scheduling
+
+Two CUDA streams: `self.stream` (scheduler) and `self.engine.stream` (engine). The idea: while GPU computes batch N, CPU prepares batch N+1 and processes results from batch N-1.
+
+`normal_loop`: receive → schedule → forward → wait → process results → repeat. Simple, one batch at a time.
+
+`overlap_loop(last_data)`: each iteration does three things concurrently:
+1. Receive new messages, process into queues.
+2. `_schedule_next_batch()` → `_prepare_batch()` builds ForwardInput (page table, KV allocation, attention metadata) on the scheduler stream. Then `engine.stream.wait_stream(self.stream)` syncs, and `_forward()` launches model forward + sampling on the engine stream (async). Returns `ongoing_data` for next iteration.
+3. `_process_last_data(last_data)` — processes the *previous* iteration's results (copy tokens to CPU, update Req state, free finished, cache prefixes). GPU meanwhile runs the new forward.
+
+Two correctness tricks:
+- `lazy_free_region()`: defers page freeing until after `_process_last_data` finishes. If we freed immediately, the running forward might read pages we just freed.
+- `finished_reqs` set: prevents double-free when the same request finishes in two consecutive overlap iterations.
+
+Disabled via `MINISGL_DISABLE_OVERLAP_SCHEDULING=1` (falls back to `normal_loop`).
 
 ## Serving API & Tokenizer
+
+Process architecture:
+
+```
+FastAPI Server (rank0) ──ZMQ──→ Tokenizer/Detokenizer ──ZMQ──→ Scheduler (TP0..N)
+      ↑                                        ↑                      │
+      └──────────────ZMQ───────────────────────┘                      │
+                                                                      │
+                          ←─────────────ZMQ──────────────←────────────┘
+```
+
+API to token: FastAPI receives request → sends `TokenizeMsg` via ZMQ PUSH to tokenizer → tokenizer encodes text to token IDs → sends `UserMsg` to scheduler → scheduler runs inference → returns `DetokenizeMsg` back to detokenizer → detokenizer decodes to text → sends `UserReply` back to frontend → SSE streamed to client.
+
+### API Server (`server/api_server.py`)
+
+FastAPI with three endpoints: `/generate` (simple), `/v1/chat/completions` (OpenAI-compatible, streaming + non-streaming), `/v1/models`. All return `StreamingResponse` with SSE for streaming.
+
+`FrontendManager`: tracks each request by `uid`, maintains `ack_map[uid]` for collecting incremental replies and `event_map[uid]` for async notification. Each request: allocate uid → send TokenizeMsg → async generator yields chunks from wait_for_ack → stream to client.
+
+Client disconnect detection via `request.is_disconnected()` — sends `AbortMsg` to cancel.
+
+Interactive shell mode (`--shell-mode`): TUI using `prompt_toolkit`, maintains chat history, calls the same backend.
+
+### Tokenizer/Detokenizer (`tokenizer/server.py`)
+
+Single worker process that does both tokenization and detokenization. Loop: pull batch from ZMQ → classify messages (DetokenizeMsg / TokenizeMsg / AbortMsg) → process → push results back.
+
+TokenizeManager: calls `tokenizer.encode()` or `tokenizer.apply_chat_template()` for chat messages.
+
+DetokenizeManager: per-uid state tracking. Incremental decoding handles the fact that a single new token might not form a complete character. Uses `batch_decode()` and tracks `decoded_ids` / `read_offset` / `sent_offset` to only output complete, printable text. Special handling for CJK characters (single chars are always safe) and incomplete UTF-8 (`�`).
+
+### Message Protocol (`message/`)
+
+Three message families, all ZMQ-serialized via a custom JSON-based protocol (supports nested dataclasses and 1D tensors as numpy byte buffers):
+
+- Tokenizer messages: `TokenizeMsg` (text → tokens), `DetokenizeMsg` (token → text), `AbortMsg`
+- Backend messages: `UserMsg` (input_ids + sampling params), `AbortBackendMsg`, `ExitMsg`
+- Frontend messages: `UserReply` (incremental text + finished flag)
+
+Each family has a `Batch*` variant for batching multiple messages in one ZMQ frame.
+
+ZMQ pattern: PUSH/PULL for point-to-point. Async wrappers (`ZmqAsyncPushQueue` / `ZmqAsyncPullQueue`) for the FastAPI frontend, sync wrappers for the tokenizer and scheduler. For multi-TP, PUB/SUB for broadcasting from rank 0 to other ranks.
