@@ -442,9 +442,90 @@ CUDA graph support: all three implement `init_capture_graph` / `prepare_for_capt
 
 Auto-selection: B200 → trtllm, H100 → fa+fi hybrid, others → fi.
 
-## Model Implementations (Layers & Architectures) 
+## Model Implementations (Layers & Architectures)
+
+All models share the same structure: `ForCausalLM` wraps a `Model` (embedding + decoder layers + final norm) + `lm_head`. The forward pass reads `input_ids` from the global context batch, runs through layers, produces logits.
+
+### Building blocks (`layers/`)
+
+Decoder layer pattern (same across Llama, Qwen2, Qwen3):
+1. input_layernorm (RMSNormFused — fused add + norm, saves a kernel launch)
+2. self_attn: QKV projection → Q/K norm (optional) → RoPE → AttentionLayer → O projection
+3. post_attention_layernorm
+4. mlp: gate+up projection → activation (silu/gelu) → down projection
+
+Residual is streamed through layers as a separate tensor: each `RMSNormFused.forward(x, residual)` does `x = x + residual` then norms, and returns `(normed_x, old_x_as_new_residual)`. This avoids materializing the full residual at every layer.
+
+Linear layers are TP-aware (tensor-parallel sharded):
+- `LinearQKVMerged`: fused QKV in one matrix. Output dim split across TP ranks (column-parallel).
+- `LinearColParallelMerged`: gate+up fused. Output dim split across TP ranks.
+- `LinearRowParallel`: down_proj. Input dim split → each rank computes partial → all-reduce.
+- `LinearOProj`: same as row-parallel but for attention output.
+- `LinearReplicated`: full copy on every rank (used for MoE router gate).
+- `VocabParallelEmbedding`: vocab sharded across ranks. Lookup returns partial embeddings → all-reduce. `ParallelLMHead` extends it with all-gather at the end (prefill: only last positions, decode: all).
+
+AttentionLayer (`layers/attention.py`): splits fused QKV, optionally applies Q/K norm, applies RoPE to Q and K, then calls `ctx.attn_backend.forward(q, k, v, layer_id, batch)` — the backend handles KV cache read/write and paged attention.
+
+MoE layer (`layers/moe.py`): `gate_up_proj` has shape `(num_experts, 2*intermediate, hidden)` and `down_proj` has shape `(num_experts, hidden, intermediate)`. Forward delegates to `moe_backend.forward()` (fused kernel). If TP > 1, all-reduce after.
+
+### Model registry (`models/register.py`)
+
+Maps HF architecture names to implementations: `LlamaForCausalLM`, `Qwen2ForCausalLM`, `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`, `MistralForCausalLM`.
+
+### ModelConfig (`models/config.py`)
+
+Parsed from HuggingFace `config.json`. Canonical field names hide differences between model families (e.g., `rope_theta` location differs between Llama and Mistral). The `is_moe` property checks if `model_type` contains "moe".
+
+### Weight loading (`models/weight.py`)
+
+Streams from safetensors files. For each tensor:
+1. Shard by TP rank (dim-0 for Q/K/V/gate/up, dim-1 for O/down, vocab range for embeddings)
+2. Fuse Q+K+V into `qkv_proj` and gate+up into `gate_up_proj` (single matrix multiply instead of three/two)
+3. For MoE: stack per-expert weights into a single `(num_experts, ...)` tensor
+
+### Model differences
+
+| Model | Attn Bias | Q/K Norm | MLP Type |
+|--------|-----------|----------|----------|
+| Llama 3 | No | No | Gated (silu) |
+| Qwen 2.5 | Yes | No | Gated (silu) |
+| Qwen 3 (dense) | No | Yes | Gated (silu) |
+| Qwen 3 (MoE) | No | Yes | MoE (silu) |
+| Mistral | No | No | Gated (silu) |
+
+Despite these differences, all use the same `RopeAttn` and `GatedMLP`/`MoEMLP` helpers from `models/utils.py` — just parameterized differently.
 
 ## Tensor Parallelism & Distributed Communication
+
+TP splits model weights across multiple GPUs on the same node. Each GPU holds a shard of every weight matrix and computes a partial result, then communicates to combine.
+
+### How TP is set up
+
+`launch.py` spawns one process per GPU (passed via `--tp-size`). Each process gets `DistributedInfo(rank=i, size=N)`. Processes join a process group via `init_process_group`. Rank 0 also spawns tokenizer/detokenizer workers.
+
+`set_tp_info(rank, size)` stores a global singleton. Every layer reads it via `get_tp_info()` to know its shard dimensions.
+
+### Communication (`distributed/impl.py`)
+
+Two backends, both wrapped by `DistributedCommunicator`:
+
+1. `TorchDistributedImpl` (default) — uses `torch.distributed.all_reduce` / `all_gather_into_tensor`. Simple, works everywhere.
+
+2. `PyNCCLDistributedImpl` (enabled by default via `--use-pynccl`) — custom NCCL wrapper in `kernel/pynccl.py`. Lower latency than torch's default because it bypasses the Python NCCL binding layer.
+
+`enable_pynccl_distributed()` pushes PyNCCL onto a plugin stack. `DistributedCommunicator` delegates to the last plugin. If TP=1, no plugin is pushed and communication is a no-op.
+
+### Where communication happens
+
+| Layer | Operation | Why |
+|--------|-----------|-----|
+| LinearRowParallel (down_proj) | all-reduce | Each rank computes partial output → sum |
+| LinearOProj (attn O) | all-reduce | Same pattern: partial O → sum |
+| VocabParallelEmbedding | all-reduce | Each rank looks up its vocab shard → sum embeddings |
+| ParallelLMHead | all-gather | Each rank computes logits for its vocab shard → gather full vocab |
+| MoELayer | all-reduce | Each rank processes its expert shard → sum |
+
+Column-parallel layers (QKV, gate_up) and replicated layers (MoE router) don't need communication because each rank's output is already correct for the next column-parallel layer.
 
 ## Overlap Scheduling 
 
